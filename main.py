@@ -1,12 +1,11 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-import httpx
-import subprocess
-import uuid
-from pathlib import Path
 import os
-import shutil
+import uuid
+import tempfile
+import subprocess
+from pathlib import Path
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import FileResponse
 
 app = FastAPI(title="Overlay Service", version="1.0.0")
 
@@ -17,13 +16,8 @@ FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
 # Default font – adjust if you want a different one
 DEFAULT_FONT = os.environ.get(
     "OVERLAY_FONT_FILE",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
 )
-
-
-class OverlayRequest(BaseModel):
-    video_url: str        # public URL to mp4
-    overlay_text: str     # overlay text, can contain \n
 
 
 def _escape_for_ffmpeg(text: str) -> str:
@@ -37,43 +31,59 @@ def _escape_for_ffmpeg(text: str) -> str:
     return out
 
 
-@app.post("/overlay")
-async def overlay(req: OverlayRequest):
-    # Basic validation
-    if not req.video_url.startswith("http"):
-        raise HTTPException(status_code=400, detail="video_url must be http(s)")
+@app.get("/")
+def health():
+    return {"status": "ok"}
 
-    if len(req.overlay_text) > 300:
+
+@app.post("/overlay")
+async def overlay(
+    video: UploadFile = File(...),
+    overlay_text: str = Form(...),
+):
+    """
+    Accepts:
+      - video: uploaded MP4 file (binary)
+      - overlay_text: text to overlay (can contain newlines)
+
+    Returns:
+      - processed MP4 with text overlayed near the bottom.
+    """
+
+    if not video.filename:
+        raise HTTPException(status_code=400, detail="Video file is required")
+
+    if len(overlay_text) > 300:
         raise HTTPException(status_code=400, detail="overlay_text too long")
 
-    tmp_root = Path("/tmp")
-    work_dir = tmp_root / f"overlay-{uuid.uuid4().hex}"
+    # Make sure font exists (inside the container this will be installed by Dockerfile)
+    if not Path(DEFAULT_FONT).exists():
+        raise HTTPException(
+            status_code=500,
+            detail=f"Font file not found at {DEFAULT_FONT}",
+        )
+
+    # Temp files
+    tmp_dir = Path(tempfile.gettempdir())
+    work_dir = tmp_dir / f"overlay-{uuid.uuid4().hex}"
     work_dir.mkdir(parents=True, exist_ok=True)
 
     input_path = work_dir / "input.mp4"
     output_path = work_dir / "output.mp4"
 
     try:
-        # 1) Download the source video
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.get(req.video_url)
-            r.raise_for_status()
-            input_path.write_bytes(r.content)
+        # Save uploaded video to disk
+        with input_path.open("wb") as f:
+            f.write(await video.read())
 
-        # 2) Prepare ffmpeg drawtext filter
-        if not Path(DEFAULT_FONT).exists():
-            # For Windows local dev, we override this later; for now just fail if missing.
-            raise HTTPException(
-                status_code=500,
-                detail=f"Font file not found at {DEFAULT_FONT}"
-            )
-
-        text = _escape_for_ffmpeg(req.overlay_text)
+        # Prepare drawtext filter
+        text = _escape_for_ffmpeg(overlay_text)
 
         drawtext_filter = (
             f"drawtext=fontfile='{DEFAULT_FONT}':"
             f"text='{text}':"
             "fontcolor=white:fontsize=48:borderw=2:"
+            "box=1:boxcolor=black@0.5:boxborderw=10:"
             "x=(w-text_w)/2:"
             "y=h-text_h-120"
         )
@@ -81,9 +91,12 @@ async def overlay(req: OverlayRequest):
         cmd = [
             FFMPEG_BIN,
             "-y",
-            "-i", str(input_path),
-            "-vf", drawtext_filter,
-            "-c:a", "copy",
+            "-i",
+            str(input_path),
+            "-vf",
+            drawtext_filter,
+            "-c:a",
+            "copy",
             str(output_path),
         ]
 
@@ -92,18 +105,30 @@ async def overlay(req: OverlayRequest):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+
         if proc.returncode != 0:
             raise HTTPException(
                 status_code=500,
                 detail=f"ffmpeg failed: {proc.stderr.decode('utf-8', 'ignore')}",
             )
 
-        # 3) Stream back the result
-        return StreamingResponse(
-            output_path.open("rb"),
+        # Send back the file
+        return FileResponse(
+            path=str(output_path),
             media_type="video/mp4",
+            filename=video.filename or "overlay_output.mp4",
         )
 
     finally:
+        # Clean up temp files
         if work_dir.exists():
-            shutil.rmtree(work_dir, ignore_errors=True)
+            for p in work_dir.iterdir():
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+            try:
+                work_dir.rmdir()
+            except Exception:
+                pass
+
