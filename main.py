@@ -1,134 +1,179 @@
-import os
-import uuid
-import tempfile
+import logging
+import shutil
 import subprocess
+import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, PlainTextResponse, JSONResponse
 
+# -----------------------------------------------------------------------------
+# App setup
+# -----------------------------------------------------------------------------
 app = FastAPI(title="Overlay Service", version="1.0.0")
 
-# Path to ffmpeg; for most Linux containers it's just "ffmpeg".
-# On Windows local dev, you can set FFMPEG_BIN to the full path if needed.
-FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("overlay-service")
 
-# Default font – adjust if you want a different one
-DEFAULT_FONT = os.environ.get(
-    "OVERLAY_FONT_FILE",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-)
+BASE_TMP = Path("/tmp")
 
 
-def _escape_for_ffmpeg(text: str) -> str:
+# -----------------------------------------------------------------------------
+# Health
+# -----------------------------------------------------------------------------
+@app.get("/", response_class=PlainTextResponse, summary="Health")
+async def health() -> str:
     """
-    Escape characters so ffmpeg drawtext can handle the string.
+    Simple health endpoint.
+    Render hits this with GET and HEAD; 405 on HEAD is okay but noisy.
     """
-    out = text.replace("\\", "\\\\")
-    out = out.replace(":", r"\:")
-    out = out.replace("'", r"\'")
-    out = out.replace("\n", r"\n")
-    return out
+    return "OK"
 
 
-@app.get("/")
-def health():
-    return {"status": "ok"}
+# -----------------------------------------------------------------------------
+# Helper: run ffmpeg
+# -----------------------------------------------------------------------------
+def run_ffmpeg(input_path: Path, output_path: Path, overlay_text: str) -> None:
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+    drawtext = (
+        f"drawtext=fontfile='{font_path}':"
+        f"text='{overlay_text}':"
+        "fontcolor=white:fontsize=28:"
+        "box=1:boxcolor=black@0.5:boxborderw=5:"
+        "x=(w-text_w)/2:y=h-(text_h*2)"
+    )
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-vf",
+        drawtext,
+        "-codec:a",
+        "copy",
+        str(output_path),
+    ]
+
+    logger.info("FFMPEG CMD: %s", " ".join(cmd))
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    logger.info("FFMPEG return code: %s", proc.returncode)
+
+    if proc.returncode != 0:
+        stderr_text = proc.stderr.decode(errors="ignore")
+        logger.error("FFMPEG FAILED. First 4000 chars of stderr:\n%s", stderr_text[:4000])
+        raise RuntimeError(f"ffmpeg failed with code {proc.returncode}")
 
 
-@app.post("/overlay")
+# -----------------------------------------------------------------------------
+# DEBUG ENDPOINT (no ffmpeg)
+# -----------------------------------------------------------------------------
+@app.post("/overlay-debug", summary="Debug upload only (no ffmpeg)")
+async def overlay_debug(
+    video: UploadFile = File(...),
+    overlay_text: str = Form(...),
+):
+    """
+    Debug helper: just saves the uploaded video to /tmp,
+    logs a bunch of info, and returns JSON. No ffmpeg.
+    """
+    workdir = BASE_TMP / f"overlay-{uuid.uuid4().hex}"
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    input_path = workdir / "input.mp4"
+
+    logger.info(
+        "overlay-debug: filename=%s content_type=%s workdir=%s",
+        video.filename,
+        video.content_type,
+        workdir,
+    )
+
+    try:
+        with input_path.open("wb") as f:
+            shutil.copyfileobj(video.file, f)
+
+        size = input_path.stat().st_size
+        logger.info("overlay-debug: saved input.mp4 size=%s bytes", size)
+
+        return {
+            "workdir": str(workdir),
+            "input_path": str(input_path),
+            "input_size": size,
+            "overlay_text": overlay_text,
+        }
+    finally:
+        video.file.close()
+
+
+# -----------------------------------------------------------------------------
+# MAIN OVERLAY ENDPOINT
+# -----------------------------------------------------------------------------
+@app.post("/overlay", summary="Create overlayed video")
 async def overlay(
     video: UploadFile = File(...),
     overlay_text: str = Form(...),
 ):
     """
-    Accepts:
-      - video: uploaded MP4 file (binary)
-      - overlay_text: text to overlay (can contain newlines)
-
-    Returns:
-      - processed MP4 with text overlayed near the bottom.
+    Accepts an MP4 and overlay text, runs ffmpeg, and returns the MP4.
+    Loudly logs any errors and never tries to send a non-existent file.
     """
+    workdir = BASE_TMP / f"overlay-{uuid.uuid4().hex}"
+    workdir.mkdir(parents=True, exist_ok=True)
 
-    if not video.filename:
-        raise HTTPException(status_code=400, detail="Video file is required")
+    input_path = workdir / "input.mp4"
+    output_path = workdir / "output.mp4"
 
-    if len(overlay_text) > 300:
-        raise HTTPException(status_code=400, detail="overlay_text too long")
-
-    # Make sure font exists (inside the container this will be installed by Dockerfile)
-    if not Path(DEFAULT_FONT).exists():
-        raise HTTPException(
-            status_code=500,
-            detail=f"Font file not found at {DEFAULT_FONT}",
-        )
-
-    # Temp files
-    tmp_dir = Path(tempfile.gettempdir())
-    work_dir = tmp_dir / f"overlay-{uuid.uuid4().hex}"
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    input_path = work_dir / "input.mp4"
-    output_path = work_dir / "output.mp4"
+    logger.info("overlay: START workdir=%s", workdir)
+    logger.info(
+        "overlay: upload filename=%s content_type=%s",
+        video.filename,
+        video.content_type,
+    )
 
     try:
-        # Save uploaded video to disk
+        # Save uploaded file
         with input_path.open("wb") as f:
-            f.write(await video.read())
+            shutil.copyfileobj(video.file, f)
 
-        # Prepare drawtext filter
-        text = _escape_for_ffmpeg(overlay_text)
+        size = input_path.stat().st_size
+        logger.info("overlay: saved input.mp4 size=%s bytes", size)
 
-        drawtext_filter = (
-            f"drawtext=fontfile='{DEFAULT_FONT}':"
-            f"text='{text}':"
-            "fontcolor=white:fontsize=48:borderw=2:"
-            "box=1:boxcolor=black@0.5:boxborderw=10:"
-            "x=(w-text_w)/2:"
-            "y=h-text_h-120"
-        )
-
-        cmd = [
-            FFMPEG_BIN,
-            "-y",
-            "-i",
-            str(input_path),
-            "-vf",
-            drawtext_filter,
-            "-c:a",
-            "copy",
-            str(output_path),
-        ]
-
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-
-        if proc.returncode != 0:
-            raise HTTPException(
+        # Run ffmpeg
+        try:
+            run_ffmpeg(input_path, output_path, overlay_text)
+        except Exception as e:
+            logger.exception("overlay: ffmpeg phase failed")
+            return JSONResponse(
                 status_code=500,
-                detail=f"ffmpeg failed: {proc.stderr.decode('utf-8', 'ignore')}",
+                content={"detail": f"ffmpeg error: {str(e)}"},
             )
 
-        # Send back the file
+        # Check output exists
+        if not output_path.exists():
+            logger.error(
+                "overlay: output.mp4 missing after ffmpeg. Dir contents: %s",
+                [p.name for p in workdir.iterdir()],
+            )
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "output video was not created"},
+            )
+
+        logger.info(
+            "overlay: SUCCESS output.mp4 size=%s bytes",
+            output_path.stat().st_size,
+        )
+
+        # IMPORTANT: do NOT delete workdir yet; FileResponse streams lazily
         return FileResponse(
             path=str(output_path),
             media_type="video/mp4",
-            filename=video.filename or "overlay_output.mp4",
+            filename="output.mp4",
         )
 
     finally:
-        # Clean up temp files
-        if work_dir.exists():
-            for p in work_dir.iterdir():
-                try:
-                    p.unlink()
-                except Exception:
-                    pass
-            try:
-                work_dir.rmdir()
-            except Exception:
-                pass
+        video.file.close()
 
