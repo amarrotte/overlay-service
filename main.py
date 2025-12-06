@@ -29,7 +29,7 @@ FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 # -------------------------------------------------------------------
 
 
-def prepare_overlay_text(raw: str, max_chars_per_line: int = 38) -> str:
+def prepare_overlay_text(raw: str, max_chars_per_line: int = 32) -> str:
     """
     Prepare overlay text for ffmpeg drawtext:
 
@@ -54,8 +54,8 @@ def prepare_overlay_text(raw: str, max_chars_per_line: int = 38) -> str:
     if current:
         lines.append(current)
 
-    # Newlines for ffmpeg
-    wrapped = r"\n".join(lines)
+    # Use *real* newline characters between lines
+    wrapped = "\n".join(lines)
 
     # 2) Escape problematic characters for drawtext
     escaped = (
@@ -82,7 +82,7 @@ def run_ffmpeg(input_path: str, output_path: str, overlay_text: str) -> None:
     drawtext = (
         f"drawtext=fontfile='{FONT_PATH}':"
         f"text='{safe_text}':"
-        "fontcolor=white:fontsize=28:box=1:boxcolor=black@0.5:boxborderw=5:"
+        "fontcolor=white:fontsize=32:box=1:boxcolor=black@0.5:boxborderw=5:"
         "x=(w-text_w)/2:y=(h-text_h)/2"
     )
 
@@ -249,4 +249,5 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
 
